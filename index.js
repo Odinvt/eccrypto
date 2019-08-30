@@ -12,9 +12,9 @@ var promise = typeof Promise === "undefined" ?
               require("es6-promise").Promise :
               Promise;
 var crypto = require("crypto");
-// try to use secp256k1, fallback to browser implementation
+// try to use secp256r1, fallback to browser implementation
 try {
-  var secp256k1 = require("secp256k1");
+  var secp256r1 = require("secp256r1");
   var ecdh = require("./build/Release/ecdh");
 } catch (e) {
   if (process.env.ECCRYPTO_NO_FALLBACK) {
@@ -35,8 +35,7 @@ function isValidPrivateKey(privateKey) {
   {
     return false;
   }
-  return privateKey.compare(ZERO32) > 0 && // > 0
-  privateKey.compare(EC_GROUP_ORDER) < 0; // < G
+  return secp256r1.privateKeyVerify(privateKey)
 }
 
 function assert(condition, message) {
@@ -49,15 +48,25 @@ function sha512(msg) {
   return crypto.createHash("sha512").update(msg).digest();
 }
 
-function aes256CbcEncrypt(iv, key, plaintext) {
-  var cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
-  var firstChunk = cipher.update(plaintext);
-  var secondChunk = cipher.final();
-  return Buffer.concat([firstChunk, secondChunk]);
+function sha256(msg) {
+  return crypto.createHash("sha256").update(msg).digest();
 }
 
-function aes256CbcDecrypt(iv, key, ciphertext) {
-  var cipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+function aes128gcmEncrypt(iv, key, plaintext) {
+  var cipher = crypto.createCipheriv("aes-128-gcm", key, iv);
+  var firstChunk = cipher.update(plaintext);
+  var secondChunk = cipher.final();
+
+  var tag = cipher.getAuthTag();
+
+  return Buffer.concat([firstChunk, secondChunk, tag]);
+}
+
+function aes128gcmDecrypt(iv, key, ciphertext, tag) {
+  var cipher = crypto.createDecipheriv("aes-128-gcm", key, iv);
+
+  cipher.setAuthTag(tag);
+
   var firstChunk = cipher.update(ciphertext);
   var secondChunk = cipher.final();
   return Buffer.concat([firstChunk, secondChunk]);
@@ -113,9 +122,9 @@ exports.generatePrivate = function() {
 var getPublic = exports.getPublic = function(privateKey) {
   assert(privateKey.length === 32, "Bad private key");
   assert(isValidPrivateKey(privateKey), "Bad private key");
-  // See https://github.com/wanderer/secp256k1-node/issues/46
-  var compressed = secp256k1.publicKeyCreate(privateKey);
-  return secp256k1.publicKeyConvert(compressed, false);
+  // See https://github.com/wanderer/secp256r1-node/issues/46
+  var compressed = secp256r1.publicKeyCreate(privateKey);
+  return secp256r1.publicKeyConvert(compressed, false);
 };
 
 /**
@@ -124,8 +133,8 @@ var getPublic = exports.getPublic = function(privateKey) {
 var getPublicCompressed = exports.getPublicCompressed = function(privateKey) { // jshint ignore:line
   assert(privateKey.length === 32, "Bad private key");
   assert(isValidPrivateKey(privateKey), "Bad private key");
-  // See https://github.com/wanderer/secp256k1-node/issues/46
-  return secp256k1.publicKeyCreate(privateKey);
+  // See https://github.com/wanderer/secp256r1-node/issues/46
+  return secp256r1.publicKeyCreate(privateKey);
 };
 
 /**
@@ -142,8 +151,8 @@ exports.sign = function(privateKey, msg) {
     assert(msg.length > 0, "Message should not be empty");
     assert(msg.length <= 32, "Message is too long");
     msg = pad32(msg);
-    var sig = secp256k1.signSync(msg, privateKey).signature;
-    resolve(secp256k1.signatureExport(sig));
+    var sig = secp256r1.signSync(msg, privateKey).signature;
+    resolve(secp256r1.signatureExport(sig));
   });
 };
 
@@ -160,8 +169,8 @@ exports.verify = function(publicKey, msg, sig) {
     assert(msg.length > 0, "Message should not be empty");
     assert(msg.length <= 32, "Message is too long");
     msg = pad32(msg);
-    sig = secp256k1.signatureImport(sig);
-    if (secp256k1.verifySync(msg, sig, publicKey)) {
+    sig = secp256r1.signatureImport(sig);
+    if (secp256r1.verifySync(msg, sig, publicKey)) {
      resolve(null);
     } else {
      reject(new Error("Bad signature"));
@@ -183,6 +192,26 @@ var derive = exports.derive = function(privateKeyA, publicKeyB) {
     resolve(ecdh.derive(privateKeyA, publicKeyB));
   });
 };
+
+function toBigEndian(n){
+  return n.toString(16)
+          .match(/[\da-f]/g)
+          .reduceRight((r,c,i,a) => (a.length-i)%2 ? r.concat(c) : (r[r.length-1] = c + r[r.length-1],r),[])
+          .map(s => s.length === 1 ? 0+s : s)
+          .reduce((p,c,i,a) => i < a.length-1 ? p + " " + c : p + " " + c + " 00".repeat(~~((4-a.length))));
+}
+
+var X963KDF = exports.X963KDF = function(length, sharedInfo, key_material) {
+  var counter = 1
+
+  var h = crypto.createHash("sha256");
+
+    h.update(key_material);
+    h.update(toBigEndian(counter));
+    h.update(sharedInfo)
+
+    return h.digest()
+}
 
 /**
  * Input/output structure for ECIES operations.
@@ -217,19 +246,15 @@ exports.encrypt = function(publicKeyTo, msg, opts) {
     ephemPublicKey = getPublic(ephemPrivateKey);
     resolve(derive(ephemPrivateKey, publicKeyTo));
   }).then(function(Px) {
-    var hash = sha512(Px);
-    var iv = opts.iv || crypto.randomBytes(16);
-    var encryptionKey = hash.slice(0, 32);
-    var macKey = hash.slice(32);
-    var ciphertext = aes256CbcEncrypt(iv, encryptionKey, msg);
-    var dataToMac = Buffer.concat([iv, ephemPublicKey, ciphertext]);
-    var mac = Buffer.from(hmacSha256(macKey, dataToMac));
-    return {
-      iv: iv,
-      ephemPublicKey: ephemPublicKey,
-      ciphertext: ciphertext,
-      mac: mac,
-    };
+    var hash = X963KDF(32, ephemPublicKey, Px)
+    var encryptionKey = hash.slice(0, 16)
+    var iv = hash.slice(16)
+
+    var cipherText = aes128gcmEncrypt(iv, encryptionKey, msg);
+
+    return Buffer.concat([ephemPublicKey, cipherText]);
+  }).catch(function(e) {
+    console.error(e);
   });
 };
 
@@ -241,19 +266,24 @@ exports.encrypt = function(publicKeyTo, msg, opts) {
  * @return {Promise.<Buffer>} - A promise that resolves with the
  * plaintext on successful decryption and rejects on failure.
  */
-exports.decrypt = function(privateKey, opts) {
-  return derive(privateKey, opts.ephemPublicKey).then(function(Px) {
+exports.decrypt = function(privateKey, data) {
+
+
+  var ephemPublicKey = data.slice(0,65)
+  var cipherText = data.slice(65,-16)
+  var tag = data.slice(-16)
+
+  return derive(privateKey, ephemPublicKey).then(function(Px) {
+
     assert(privateKey.length === 32, "Bad private key");
     assert(isValidPrivateKey(privateKey), "Bad private key");
-    var hash = sha512(Px);
-    var encryptionKey = hash.slice(0, 32);
-    var macKey = hash.slice(32);
-    var dataToMac = Buffer.concat([
-      opts.iv,
-      opts.ephemPublicKey,
-      opts.ciphertext
-    ]);
-    var realMac = hmacSha256(macKey, dataToMac);
-    assert(equalConstTime(opts.mac, realMac), "Bad MAC"); return aes256CbcDecrypt(opts.iv, encryptionKey, opts.ciphertext);
+
+    var hash = X963KDF(32, ephemPublicKey, Px)
+    var encryptionKey = hash.slice(0, 16);
+    var iv = hash.slice(16)
+
+    return aes128gcmDecrypt(iv, encryptionKey, cipherText, tag);
+  }).catch(function(e) {
+    console.error(e);
   });
 };
